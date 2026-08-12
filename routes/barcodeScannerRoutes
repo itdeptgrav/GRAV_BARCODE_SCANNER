@@ -1,0 +1,548 @@
+// routes/CMS_Routes/Production/Tracking/trackingRoutes.js
+//
+// CHANGES FROM PREVIOUS VERSION:
+//  1. sanitizeTimestamp() — replaces 1969/1970 timestamps with server time
+//     Applied in both /scan and /bulk-scans endpoints
+//  2. /scan deduplication — barcode scans checked before inserting
+//     Prevents double-counting if background send + batch both succeed
+//  3. All existing routes kept unchanged
+
+const express = require("express");
+const router = express.Router();
+const mongoose = require("mongoose");
+const ProductionTracking = require("../models/ProductionTracking");
+const Employee = require("../models/Employee");
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+const isBarcodeId = (id) => id && typeof id === "string" && id.startsWith("WO-");
+const isEmployeeId = (id) => id && typeof id === "string" && id.startsWith("GR");
+
+const extractEmployeeIdFromUrl = (value) => {
+  try {
+    if (!value || typeof value !== "string") return value;
+    const trimmed = value.trim();
+    if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) {
+      const url = new URL(trimmed);
+      const parts = url.pathname.split("/").filter(Boolean);
+      return parts[parts.length - 1] || value;
+    }
+    return value;
+  } catch {
+    return value;
+  }
+};
+
+const normaliseActiveOps = (raw) => {
+  if (!raw) return [];
+  if (Array.isArray(raw))
+    return raw.flatMap((s) => String(s).split(",")).map((s) => s.trim()).filter(Boolean);
+  if (typeof raw === "string")
+    return raw.split(",").map((s) => s.trim()).filter(Boolean);
+  return [];
+};
+
+const getScanDate = (scanTime) => {
+  const d = new Date(scanTime);
+  d.setHours(0, 0, 0, 0);
+  return d;
+};
+
+// ─── Timestamp Sanitizer ──────────────────────────────────────────────────────
+// ESP32 sends 1969/1970 timestamps when NTP hasn't synced yet.
+// Replace with server time — server clock is always correct IST.
+const sanitizeTimestamp = (ts) => {
+  if (!ts) return new Date();
+  const d = new Date(ts);
+  if (isNaN(d.getTime()) || d.getFullYear() < 2024) {
+    console.warn(`[Timestamp] Invalid timestamp received: ${ts} → replaced with server time`);
+    return new Date();
+  }
+  return d;
+};
+
+// ─── Status Builder ───────────────────────────────────────────────────────────
+const buildStatusResponse = async (queryDate) => {
+  const trackingDoc = await ProductionTracking.findOne({ date: queryDate })
+    .populate("machines.machineId", "name serialNumber type")
+    .lean();
+
+  if (!trackingDoc) return null;
+
+  const identityIds = new Set();
+  for (const machine of trackingDoc.machines) {
+    if (machine.currentOperatorIdentityId) identityIds.add(machine.currentOperatorIdentityId);
+    for (const op of machine.operators) identityIds.add(op.operatorIdentityId);
+  }
+
+  const employees = await Employee.find(
+    { identityId: { $in: [...identityIds] } },
+    { firstName: 1, lastName: 1, identityId: 1 }
+  ).lean();
+
+  const empMap = Object.fromEntries(
+    employees.map((e) => [e.identityId, `${e.firstName || ""} ${e.lastName || ""}`.trim()])
+  );
+
+  let totalScans = 0;
+  const machinesStatus = [];
+
+  for (const machine of trackingDoc.machines) {
+    let machineScans = 0;
+    const operatorsWithDetails = [];
+
+    for (const operator of machine.operators) {
+      machineScans += operator.barcodeScans.length;
+      totalScans += operator.barcodeScans.length;
+
+      operatorsWithDetails.push({
+        identityId: operator.operatorIdentityId,
+        name: empMap[operator.operatorIdentityId] || "Unknown Operator",
+        signInTime: operator.signInTime,
+        signOutTime: operator.signOutTime,
+        barcodeScans: operator.barcodeScans.map((s) => ({
+          barcodeId: s.barcodeId,
+          timeStamp: s.timeStamp,
+          activeOps: s.activeOps || [],
+        })),
+        scanCount: operator.barcodeScans.length,
+        isActive: !operator.signOutTime,
+      });
+    }
+
+    machinesStatus.push({
+      machineId: machine.machineId?._id,
+      machineName: machine.machineId?.name || "Unknown Machine",
+      machineSerial: machine.machineId?.serialNumber || "Unknown",
+      currentOperator: machine.currentOperatorIdentityId
+        ? {
+            identityId: machine.currentOperatorIdentityId,
+            name: empMap[machine.currentOperatorIdentityId] || "Unknown Operator",
+          }
+        : null,
+      operators: operatorsWithDetails,
+      machineScans,
+    });
+  }
+
+  return {
+    date: trackingDoc.date,
+    totalMachines: trackingDoc.machines.length,
+    totalScans,
+    machines: machinesStatus,
+  };
+};
+
+// ─── POST /scan ────────────────────────────────────────────────────────────────
+// Primary endpoint — called on every scan via background task from device.
+// Includes deduplication: same barcodeId on same operator session = skip.
+router.post("/scan", async (req, res) => {
+  try {
+    const { scanId: rawScanId, machineId, timeStamp, activeOps = "" } = req.body;
+    const scanId = extractEmployeeIdFromUrl(rawScanId);
+
+    if (!scanId || !machineId || !timeStamp) {
+      return res.status(400).json({
+        success: false,
+        message: "scanId, machineId, and timeStamp are required",
+      });
+    }
+
+    // Sanitize timestamp — replaces 1969/1970 with server time
+    const scanTime = sanitizeTimestamp(timeStamp);
+    const activeOpsCodes = normaliseActiveOps(activeOps);
+    const scanDate = getScanDate(scanTime);
+    const machineObjId = new mongoose.Types.ObjectId(machineId);
+
+    // ─── BARCODE SCAN ──────────────────────────────────────────────────────────
+    if (isBarcodeId(scanId)) {
+      const stateDoc = await ProductionTracking.findOne(
+        { date: scanDate, "machines.machineId": machineObjId },
+        { "machines.$": 1 }
+      ).lean();
+
+      const machineState = stateDoc?.machines?.[0];
+
+      if (!machineState?.currentOperatorIdentityId) {
+        return res.status(400).json({
+          success: false,
+          message: "No operator is signed in on this machine",
+          action: "error",
+        });
+      }
+
+      const currentOpId = machineState.currentOperatorIdentityId;
+      const activeOperator = machineState.operators?.find(
+        (op) => op.operatorIdentityId === currentOpId && !op.signOutTime
+      );
+
+      if (!activeOperator) {
+        return res.status(400).json({ success: false, message: "Operator session not found" });
+      }
+
+      // ── Deduplication — skip if same barcodeId already exists in this session ──
+      // This handles the case where background send AND batch both succeed.
+      // Same piece scanned again (WO-xxx-001 already stored) = skip, not double-count.
+      const alreadyExists = activeOperator.barcodeScans?.some(
+        (s) => s.barcodeId === scanId
+      );
+      if (alreadyExists) {
+        return res.json({
+          success: true,
+          message: "Duplicate scan ignored",
+          duplicate: true,
+          employeeName: activeOperator.operatorName || "Unknown",
+          scanCount: activeOperator.barcodeScans?.length || 0,
+        });
+      }
+
+      // Atomic push
+      await ProductionTracking.updateOne(
+        { date: scanDate },
+        {
+          $push: {
+            "machines.$[m].operators.$[op].barcodeScans": {
+              barcodeId: scanId,
+              timeStamp: scanTime,
+              activeOps: activeOpsCodes,
+            },
+          },
+        },
+        {
+          arrayFilters: [
+            { "m.machineId": machineObjId },
+            { "op.operatorIdentityId": currentOpId, "op.signOutTime": null },
+          ],
+        }
+      );
+
+      return res.json({
+        success: true,
+        message: "Barcode scanned",
+        employeeName: activeOperator.operatorName || "Unknown",
+        scanCount: (activeOperator.barcodeScans?.length || 0) + 1,
+        barcodeData: { barcodeId: scanId, activeOps: activeOpsCodes },
+      });
+    }
+
+    // ─── EMPLOYEE SIGN IN / OUT ────────────────────────────────────────────────
+    if (isEmployeeId(scanId)) {
+      const operator = await Employee.findOne(
+        { identityId: scanId, needsToOperate: true, status: "active" },
+        { firstName: 1, lastName: 1, identityId: 1 }
+      ).lean();
+
+      if (!operator) {
+        return res.status(400).json({
+          success: false,
+          message: `Employee ${scanId} not found or not authorized`,
+        });
+      }
+
+      const employeeName = `${operator.firstName || ""} ${operator.lastName || ""}`.trim();
+
+      let trackingDoc = await ProductionTracking.findOne({ date: scanDate });
+      if (!trackingDoc) {
+        trackingDoc = new ProductionTracking({ date: scanDate, machines: [] });
+      }
+
+      // Auto sign-out from other machines
+      for (const m of trackingDoc.machines) {
+        if (m.currentOperatorIdentityId === scanId && m.machineId.toString() !== machineId) {
+          const session = m.operators.find(
+            (op) => op.operatorIdentityId === scanId && !op.signOutTime
+          );
+          if (session) session.signOutTime = scanTime;
+          m.currentOperatorIdentityId = null;
+        }
+      }
+
+      let machineTracking = trackingDoc.machines.find(
+        (m) => m.machineId.toString() === machineId
+      );
+      if (!machineTracking) {
+        trackingDoc.machines.push({ machineId, currentOperatorIdentityId: null, operators: [] });
+        machineTracking = trackingDoc.machines[trackingDoc.machines.length - 1];
+      }
+
+      // Same operator → sign out
+      if (machineTracking.currentOperatorIdentityId === scanId) {
+        const session = machineTracking.operators.find(
+          (op) => op.operatorIdentityId === scanId && !op.signOutTime
+        );
+        // Dedup: if already signed out, skip
+        if (!session) {
+          return res.json({ success: true, message: "Already signed out (duplicate)", duplicate: true, employeeName, employeeId: scanId, action: "signout" });
+        }
+        session.signOutTime = scanTime;
+        machineTracking.currentOperatorIdentityId = null;
+        await trackingDoc.save();
+        return res.json({ success: true, message: `${employeeName} signed out`, employeeName, employeeId: scanId, action: "signout", scanCount: 0 });
+      }
+
+      // Different operator → sign out old one
+      if (machineTracking.currentOperatorIdentityId) {
+        const existing = machineTracking.operators.find(
+          (op) => op.operatorIdentityId === machineTracking.currentOperatorIdentityId && !op.signOutTime
+        );
+        if (existing) existing.signOutTime = scanTime;
+      }
+
+      // Dedup: check if this operator already has an active session (from batch duplicate)
+      const existingSession = machineTracking.operators.find(
+        (op) => op.operatorIdentityId === scanId && !op.signOutTime
+      );
+      if (existingSession) {
+        return res.json({ success: true, message: "Already signed in (duplicate)", duplicate: true, employeeName, employeeId: scanId, action: "signin" });
+      }
+
+      // Sign in
+      machineTracking.operators.push({
+        operatorIdentityId: scanId,
+        operatorName: employeeName,
+        signInTime: scanTime,
+        signOutTime: null,
+        barcodeScans: [],
+      });
+      machineTracking.currentOperatorIdentityId = scanId;
+      await trackingDoc.save();
+
+      return res.json({ success: true, message: `${employeeName} signed in`, employeeName, employeeId: scanId, action: "signin", scanCount: 0 });
+    }
+
+    return res.status(400).json({ success: false, message: "Invalid scan ID format" });
+  } catch (error) {
+    console.error("Error processing scan:", error);
+    res.status(500).json({ success: false, message: "Server error", error: error.message });
+  }
+});
+
+// ─── POST /bulk  -scans ──────────────────────────────────────────────────────────
+// Fallback endpoint — called every 3 minutes for any scans the background
+// send missed (offline period, failed HTTP, etc).
+// Includes same timestamp sanitization and deduplication.
+router.post("/bulk-scans", async (req, res) => {
+  try {
+    const { scans } = req.body;
+    if (!scans || !Array.isArray(scans) || scans.length === 0) {
+      return res.status(400).json({ success: false, message: "Scans array is required" });
+    }
+
+    const results = { total: scans.length, successful: 0, failed: 0, duplicates: 0, errors: [] };
+    const scansByDate = {};
+
+    for (const scanData of scans) {
+      const { scanId, machineId, timeStamp } = scanData;
+      if (!scanId || !machineId || !timeStamp) {
+        results.failed++;
+        results.errors.push({ scanId, error: "Missing required fields" });
+        continue;
+      }
+      // Sanitize timestamp — replaces 1969/1970
+      const scanTime = sanitizeTimestamp(timeStamp);
+      const scanDate = getScanDate(scanTime);
+      const dateKey = scanDate.toISOString();
+      if (!scansByDate[dateKey]) scansByDate[dateKey] = { date: scanDate, machines: {} };
+      if (!scansByDate[dateKey].machines[machineId])
+        scansByDate[dateKey].machines[machineId] = { machineId, scans: [] };
+      scansByDate[dateKey].machines[machineId].scans.push({
+        ...scanData,
+        timeStamp: scanTime,
+        activeOps: normaliseActiveOps(scanData.activeOps),
+      });
+    }
+
+    for (const dateKey in scansByDate) {
+      const dateGroup = scansByDate[dateKey];
+      let trackingDoc = await ProductionTracking.findOne({ date: dateGroup.date });
+      if (!trackingDoc)
+        trackingDoc = new ProductionTracking({ date: dateGroup.date, machines: [] });
+
+      for (const machineId in dateGroup.machines) {
+        const machineData = dateGroup.machines[machineId];
+
+        let machineTracking = trackingDoc.machines.find(
+          (m) => m.machineId?.toString() === machineId
+        );
+        if (!machineTracking) {
+          trackingDoc.machines.push({ machineId, currentOperatorIdentityId: null, operators: [] });
+          machineTracking = trackingDoc.machines[trackingDoc.machines.length - 1];
+        }
+
+        for (const scan of machineData.scans) {
+          try {
+            if (scan.isEmployeeScan) {
+              const { employeeId, action } = scan;
+              const opId = employeeId || scan.scanId;
+
+              if (action === "signout") {
+                const session = machineTracking.operators.find(
+                  (op) => op.operatorIdentityId === opId && !op.signOutTime
+                );
+                if (session) {
+                  session.signOutTime = scan.timeStamp;
+                  machineTracking.currentOperatorIdentityId = null;
+                  results.successful++;
+                } else {
+                  // Already signed out — dedup
+                  results.duplicates++;
+                }
+              } else {
+                // Check if already signed in (dedup)
+                const alreadyIn = machineTracking.operators.find(
+                  (op) => op.operatorIdentityId === opId && !op.signOutTime
+                );
+                if (alreadyIn) {
+                  results.duplicates++;
+                } else {
+                  if (machineTracking.currentOperatorIdentityId) {
+                    const existing = machineTracking.operators.find(
+                      (op) => op.operatorIdentityId === machineTracking.currentOperatorIdentityId && !op.signOutTime
+                    );
+                    if (existing) existing.signOutTime = scan.timeStamp;
+                  }
+                  machineTracking.operators.push({
+                    operatorIdentityId: opId,
+                    operatorName: scan.employeeName || "",
+                    signInTime: scan.timeStamp,
+                    signOutTime: null,
+                    barcodeScans: [],
+                  });
+                  machineTracking.currentOperatorIdentityId = opId;
+                  results.successful++;
+                }
+              }
+            } else {
+              if (!machineTracking.currentOperatorIdentityId)
+                throw new Error("No operator signed in");
+
+              const operatorSession = machineTracking.operators.find(
+                (op) => op.operatorIdentityId === machineTracking.currentOperatorIdentityId && !op.signOutTime
+              );
+              if (!operatorSession) throw new Error("Operator session not found");
+
+              // Dedup: skip if this exact barcodeId already in session
+              const alreadyScanned = operatorSession.barcodeScans.some(
+                (s) => s.barcodeId === scan.scanId
+              );
+              if (alreadyScanned) {
+                results.duplicates++;
+              } else {
+                operatorSession.barcodeScans.push({
+                  barcodeId: scan.scanId,
+                  timeStamp: scan.timeStamp,
+                  activeOps: scan.activeOps,
+                });
+                results.successful++;
+              }
+            }
+          } catch (scanError) {
+            results.failed++;
+            results.errors.push({ scanId: scan.scanId, error: scanError.message });
+          }
+        }
+      }
+
+      await trackingDoc.save();
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: `Processed ${results.successful} of ${results.total} scans (${results.duplicates} duplicates skipped)`,
+      results,
+    });
+  } catch (error) {
+    console.error("Bulk scan error:", error);
+    res.status(500).json({ success: false, message: "Server error", error: error.message });
+  }
+});
+
+// ─── GET /status/today ─────────────────────────────────────────────────────────
+router.get("/status/today", async (req, res) => {
+  try {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const data = await buildStatusResponse(today);
+    if (!data) {
+      return res.json({ success: true, message: "No tracking data for today", date: today, machines: [], totalScans: 0, totalMachines: 0 });
+    }
+    res.json({ success: true, ...data });
+  } catch (error) {
+    console.error("Error getting today's status:", error);
+    res.status(500).json({ success: false, message: "Server error", error: error.message });
+  }
+});
+
+// ─── GET /status/:date ─────────────────────────────────────────────────────────
+router.get("/status/:date", async (req, res) => {
+  try {
+    const queryDate = new Date(req.params.date);
+    queryDate.setHours(0, 0, 0, 0);
+    if (isNaN(queryDate.getTime())) {
+      return res.status(400).json({ success: false, message: "Invalid date format" });
+    }
+    const data = await buildStatusResponse(queryDate);
+    if (!data) {
+      return res.json({ success: true, message: `No tracking data for ${req.params.date}`, date: queryDate, machines: [], totalScans: 0, totalMachines: 0 });
+    }
+    res.json({ success: true, ...data });
+  } catch (error) {
+    console.error("Error getting date status:", error);
+    res.status(500).json({ success: false, message: "Server error", error: error.message });
+  }
+});
+
+// ─── GET /machine/:machineId/operations ───────────────────────────────────────
+router.get("/machine/:machineId/operations", async (req, res) => {
+  try {
+    const { machineId } = req.params;
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    const trackingDoc = await ProductionTracking.findOne(
+      { date: today, "machines.machineId": new mongoose.Types.ObjectId(machineId) },
+      { "machines.$": 1 }
+    ).populate("machines.machineId", "name serialNumber type").lean();
+
+    if (!trackingDoc) {
+      return res.json({ success: true, message: "No tracking data for this machine today", machineId, operations: [] });
+    }
+
+    const machine = trackingDoc.machines?.[0];
+    if (!machine) {
+      return res.json({ success: true, message: "Machine not found in today's tracking", machineId, operations: [] });
+    }
+
+    const operationMap = {};
+    let totalScans = 0;
+
+    for (const op of machine.operators) {
+      totalScans += op.barcodeScans.length;
+      for (const scan of op.barcodeScans) {
+        const parts = scan.barcodeId?.split("-");
+        if (parts?.[0] === "WO" && parts.length >= 3) {
+          const woKey = parts[1];
+          if (!operationMap[woKey]) operationMap[woKey] = { shortId: woKey, scans: 0, operators: new Set() };
+          operationMap[woKey].scans++;
+          operationMap[woKey].operators.add(op.operatorIdentityId);
+        }
+      }
+    }
+
+    return res.json({
+      success: true, machineId,
+      machineName: machine.machineId?.name,
+      totalScans, isActive: !!machine.currentOperatorIdentityId,
+      currentOperator: machine.currentOperatorIdentityId,
+      operations: Object.values(operationMap).map((wo) => ({
+        workOrderShortId: wo.shortId, scansCount: wo.scans,
+        operatorCount: wo.operators.size, isActive: !!machine.currentOperatorIdentityId,
+      })),
+    });
+  } catch (error) {
+    console.error("Error getting machine operations:", error);
+    res.status(500).json({ success: false, message: "Server error", error: error.message });
+  }
+});
+
+module.exports = router;
